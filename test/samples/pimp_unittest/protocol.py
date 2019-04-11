@@ -1,11 +1,52 @@
+"""
+TODO List
+    * untested code
+"""
+from playground.network.common import StackingProtocolFactory, StackingProtocol, StackingTransport
+
+from playground.network.packet.fieldtypes import BOOL, UINT32, BUFFER, STRING
+from playground.network.common import PlaygroundAddress
+
+# MessageDefinition is the base class of all automatically serializable messages
+from playground.network.packet import PacketType
+import playground
+
 import sys
-sys.path.append("../../../../src/reliable_layers/")
-from y20191_pimp.protocol import PimpClientProtocol, PimpServerProtocol, PIMPPacket
-from playground.network.testing.mock import MockTransportToStorageStream as MockTransport
-from playground.asyncio_lib.testing import TestLoopEx
-from playground.common.logging import EnablePresetLogging, PRESET_DEBUG
-from unittest.mock import MagicMock
-import unittest, io, asyncio, hashlib, os
+import time
+import os
+import logging
+import asyncio
+import random
+import hashlib
+#logger = logging.getLogger(__name__)
+seqClientDictionary = {}
+seqServerDictionary = {}
+PACKET_MAX_SIZE = 50
+
+
+class PIMPPacket(PacketType):
+    """
+    EchoProtocolPacket is a simple message for sending a bit of
+    data and getting the same data back as a response (echo). The
+    "header" is simply a 1-byte boolean that indicates whether or
+    not it is the original message or the echo.
+    """
+
+    DEFINITION_IDENTIFIER = "PIMP.packet"
+
+    DEFINITION_VERSION = "1.0"
+
+    FIELDS = [
+        ("seqNum", UINT32),
+        ("ackNum", UINT32),
+        ("ACK", BOOL),
+        ("RST", BOOL),
+        ("SYN", BOOL),
+        ("FIN", BOOL),
+        ("RTR", BOOL),
+        ("checkSum", BUFFER),
+        ("data", BUFFER)
+    ]
 
 def create_packet(**config):
     packet = PIMPPacket()
@@ -18,368 +59,374 @@ def create_packet(**config):
     packet.FIN    = config.get("FIN",False)
     packet.data   = config.get("data", b"")
     packet.checkSum = b""
-    packet_bytes  = packet.__serialize__()
-    packet.checkSum = hashlib.md5(packet_bytes).digest()
+    packet.checkSum = hashlib.md5(packet.__serialize__()).digest()
     return packet
-    
-class PacketStream:
-    def __init__(self):
-        self.packets = []
-        
+
+class PIMPTransport(StackingTransport):
     def write(self, data):
-        deserializer = PIMPPacket.Deserializer()
-        deserializer.update(data)
-        self.packets += list(deserializer.nextPackets())
+        # @hint: For higher layer protocol to write the data
+        # if close = true: close()
+        seqNum = random.randint(1, 2147483647//10)
+        while(len(data) >= PACKET_MAX_SIZE):
+            pimpPacket = create_packet(seqNum=seqNum)
 
-class TestLegalCommands(unittest.TestCase):
-    def setUp(self):
-        self.loop = TestLoopEx()
-        asyncio.set_event_loop(self.loop)
-        self.client = PimpClientProtocol()
-        self.client.setHigherProtocol(MagicMock())
-        self.client_transport = MockTransport(PacketStream())
-        self.server = PimpServerProtocol()
-        self.server.setHigherProtocol(MagicMock())
-        self.server_transport = MockTransport(PacketStream())
-        
-    def tearDown(self):
-        self.loop.close()
-        
-    def test_normal_handshake_client(self):
-        
-        # create connection. should send SYN
-        self.client.connection_made(self.client_transport)
-        
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        client_syn = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(client_syn.SYN)
-        
-        # create server response with SYN_ACK.
-        # ackNum = client seqNum + 1
-        server_seqNum = 300
-        syn_ack_packet = create_packet(
-            seqNum=server_seqNum, 
-            ackNum=client_syn.seqNum+1, 
-            SYN=True,
-            ACK=True)
-        self.client.data_received(syn_ack_packet.__serialize__())
-        
-        # at this point, the entire handshake should be over.
-        # check and client transmissions
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        client_ack = self.client_transport.sink.packets.pop(0)
+            pimpPacket.data = data[:PACKET_MAX_SIZE]
+            pimpPacket.checkSum = self.calculate_checksum(pimpPacket)
+            self.lowerTransport().write(pimpPacket.__serialize__())
+            print("DEBUGGG: Data: ", data)
+            print("DEBUGGG: Data Length ", len(data))
+            print("Teardown packet sent!")
 
-        self.assertTrue(client_ack.ACK)
-        self.assertEqual(client_ack.ackNum, server_seqNum+1)
-        
-        # verify that higher protocol's connection made was called
-        self.client.higherProtocol().connection_made.assert_called()
-        
-    def test_handshake_client_on_client_crash(self):
-        
-        # create connection. should send SYN
-        self.client.connection_made(self.client_transport)
-        
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        client_syn = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(client_syn.SYN)
-        
-        # create server response ASSUMING server was not in listening state.
-        # this is based on example in PRFC after client crash
-        # pick arbitrary sequence number and ack number
-        server_syn = 400
-        server_ack = 100
-        bad_ack_packet = create_packet(
-            seqNum=server_syn, 
-            ackNum=server_ack,
-            ACK=True)
-        self.client.data_received(bad_ack_packet.__serialize__())
-        
-        self.assertEqual(len(self.client_transport.sink.packets) > 0)
-        client_rst = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(client_rst.RST)
-        self.assertEqual(client_rst.seqNum, server_ack)
-        
-        # client should resend SYN
-        self.loop.advanceClock(10)
-        
-        # various student implementations might have
-        # multiple functions that trigger once, sending
-        # multiple packets. simply check if the first
-        # packet is the SYN
-        self.assertTrue(len(self.client_transport.sink.packets) > 0)
-        client_syn2 = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(client_syn2.SYN)
-        
-    def test_normal_handshake_server(self):
-        
-        # create server
-        self.server.connection_made(self.server_transport)
-        
-        # create client SYN.
-        client_seqNum = 300
-        syn_packet = create_packet(seqNum=client_seqNum, SYN=True)
-        self.server.data_received(syn_packet.__serialize__())
-        
-        # server should have sent a syn,ack.
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        server_syn_ack = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(server_syn_ack.SYN)
-        self.assertTrue(server_syn_ack.ACK)
-        self.assertEqual(server_syn_ack.ackNum, client_seqNum+1)
+            # @hint: After sending out one of the teardown packet, update "data" & "seqNum"
+            data = data[PACKET_MAX_SIZE:len(data)]
+            seqNum += 1
 
-        # send ack to trigger session establishment
-        ack_packet = create_packet(
-            seqNum=client_seqNum+1, 
-            ackNum=server_syn_ack.seqNum+1, 
-            ACK=True)
-        self.server.data_received(ack_packet.__serialize__())
-        
-        # at this point, server should have called connection_made
-        self.server.higherProtocol().connection_made.assert_called()
-        
-    def test_handshake_server_on_client_crash(self):
-        # create server
-        self.server.connection_made(self.server_transport)
-        
-        # create client SYN.
-        client_seqNum = 400
-        syn_packet = create_packet(seqNum=client_seqNum, SYN=True)
-        self.server.data_received(syn_packet.__serialize__())
-        
-        # server should have sent a syn,ack.
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        server_syn_ack = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(server_syn_ack.SYN)
-        self.assertTrue(server_syn_ack.ACK)
-        self.assertEqual(server_syn_ack.ackNum, client_seqNum+1)
+        pimpPacket = create_packet(seqNum=seqNum)
+        pimpPacket.data = data
+        new_checksum = self.calculate_checksum(pimpPacket)
+        pimpPacket.checksum = new_checksum
+        self.lowerTransport().write(pimpPacket.__serialize__())
+        print("DEBUGGGGG: Data: ", data)
+        print("DEBUGGGGG: Data size: ", len(data))
+        print("^^^ PIMPTransport sent a packet! ^^^")
 
-        # create new client SYN after crash.
-        # pick a sequence number outside of window
-        client_seqNum2 = 300
-        syn2_packet = create_packet(seqNum=client_seqNum2, SYN=True)
-        self.server.data_received(syn2_packet.__serialize__())
-        
-        # server should send an ACK with old seq num + 1
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        server_ack = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(server_ack.ACK)
-        self.assertEqual(server_ack.ackNum, client_seqNum+1)
-        
-        # send client RST
-        rst_packet = create_packet(seqNum=server_ack.ackNum, RST=True)
-        self.server.data_received(rst_packet.__serialize__())
-        
-        # resend client post-crash syn
-        self.server.data_received(syn2_packet.__serialize__())
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        server_syn_ack = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(server_syn_ack.SYN)
-        self.assertTrue(server_syn_ack.ACK)
-        self.assertEqual(server_syn_ack.ackNum, client_seqNum2+1)
-        
-    def test_no_error_data_transmission(self):
-        # connect the client and server
-        self.server.connection_made(self.server_transport)
-        self.client.connection_made(self.client_transport)
-        
-        # handle syn
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        syn_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(syn_packet.SYN)
-        self.server.data_received(syn_packet.__serialize__())
-        
-        # handle syn_ack
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        syn_ack_packet = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(syn_ack_packet.SYN)
-        self.assertTrue(syn_ack_packet.ACK)
-        self.client.data_received(syn_ack_packet.__serialize__())
-        
-        # handle ack
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        ack_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(ack_packet.ACK)
-        self.server.data_received(ack_packet.__serialize__())
-        
-        self.client.higherProtocol().connection_made.assert_called()
-        self.server.higherProtocol().connection_made.assert_called()
-        
-        client_app_transport, = self.client.higherProtocol().connection_made.call_args[0]
-        server_app_transport, = self.server.higherProtocol().connection_made.call_args[0]
-        
-        # transmissions
-        # 1 byte
-        # 16 bytes
-        # 1024 bytes
-        # 10240 bytes
-        
-        transmissions = [os.urandom(size) for size in [1,16,1024,10240]]
-        
-        # simulate testing full duplex
-        # monitor the data as it goes from one side to the other
-        # To prevent infinite loop, error on duplicate ack
-        # and error if seq number is greater than transmission
-        # this assumes that acks are sent without timeouts.
-        # if your implementation requires timeouts in 0 error
-        # conditions, please contact us
-        client_last_ack = 0
-        server_last_ack = 0
-        client_max_seq = syn_packet.seqNum + 1
-        server_max_seq = syn_ack_packet.seqNum + 1
-        for transmission in transmissions:
-            client_app_transport.write(transmission)
-            server_app_transport.write(transmission)
-            client_max_seq += len(transmission)
-            server_max_seq += len(transmission)
-            
-            # keep sending packets until all data transmitted.
-            # see message above about preventing infinite loop
-            
-            while self.client_transport.sink.packets or self.server_transport.sink.packets:
-                if self.client_transport.sink.packets:
-                    client_packet = self.client_transport.sink.packets.pop(0)
-                    if client_packet.data:
-                        self.assertTrue(client_packet.seqNum < client_max_seq)
-                    
-                    if not client_packet.data and client_packet.ACK:
-                        self.assertTrue(client_packet.ackNum > client_last_ack)
-                        client_last_ack = client_packet.ackNum
-                    self.server.data_received(client_packet.__serialize__())
-                        
-                if self.server_transport.sink.packets:
-                    server_packet = self.server_transport.sink.packets.pop(0)
-                    if server_packet.data:
-                        self.assertTrue(server_packet.seqNum < server_max_seq)
-                    
-                    if not server_packet.data and server_packet.ACK:
-                        self.assertTrue(server_packet.ackNum > server_last_ack)
-                        server_last_ack = server_packet.ackNum
-                
-                    self.client.data_received(server_packet.__serialize__())
-        
-        clientapp_data_received = self.client.higherProtocol().data_received.call_args_list
-        serverapp_data_received = self.server.higherProtocol().data_received.call_args_list
-        for transmission in transmissions:
-            client_data = b""
-            while len(client_data) < len(transmission) and clientapp_data_received:
-                client_data += clientapp_data_received.pop(0)[0][0]
-            self.assertEqual(transmission, client_data)
-            
-            server_data = b""
-            while len(server_data) < len(transmission) and serverapp_data_received:
-                server_data += serverapp_data_received.pop(0)[0][0]
-            self.assertEqual(transmission, server_data)
-            
-    def test_client_shutdown_no_errors(self):
-        # connect the client and server
-        self.server.connection_made(self.server_transport)
-        self.client.connection_made(self.client_transport)
-        
-        # handle syn
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        syn_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(syn_packet.SYN)
-        self.server.data_received(syn_packet.__serialize__())
-        
-        # handle syn_ack
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        syn_ack_packet = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(syn_ack_packet.SYN)
-        self.assertTrue(syn_ack_packet.ACK)
-        self.client.data_received(syn_ack_packet.__serialize__())
-        
-        # handle ack
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        ack_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(ack_packet.ACK)
-        self.server.data_received(ack_packet.__serialize__())
-        
-        self.client.higherProtocol().connection_made.assert_called()
-        self.server.higherProtocol().connection_made.assert_called()
-        
-        client_app_transport, = self.client.higherProtocol().connection_made.call_args[0]
-        server_app_transport, = self.server.higherProtocol().connection_made.call_args[0]
-        
-        server_app_transport.write(b"server transmission")
-        
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        server_data_packet = self.server_transport.sink.packets.pop(0)
-        
-        self.client.data_received(server_data_packet.__serialize__())
-        
-        client_app_transport.close()
-        self.client.higherProtocol().connection_lost.assert_called()
-        
-        # there could be multiple acks, check that last packet is fin
-        self.assertTrue(len(self.client_transport.sink.packets)>= 1)
-        fin_packet = self.client_transport.sink.packets.pop(-1)
-        self.assertTrue(fin_packet.FIN)
-        
-        # We aren't even testing all the states. Just test whether
-        # or not we call server connection_lost.
-        self.server.data_received(fin_packet.__serialize__())
-        self.server.higherProtocol().connection_lost.assert_called()
-        
-    def test_reordering(self):
-        # connect the client and server
-        self.server.connection_made(self.server_transport)
-        self.client.connection_made(self.client_transport)
-        
-        # handle syn
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        syn_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(syn_packet.SYN)
-        self.server.data_received(syn_packet.__serialize__())
-        
-        # handle syn_ack
-        self.assertEqual(len(self.server_transport.sink.packets), 1)
-        syn_ack_packet = self.server_transport.sink.packets.pop(0)
-        self.assertTrue(syn_ack_packet.SYN)
-        self.assertTrue(syn_ack_packet.ACK)
-        self.client.data_received(syn_ack_packet.__serialize__())
-        
-        # handle ack
-        self.assertEqual(len(self.client_transport.sink.packets), 1)
-        ack_packet = self.client_transport.sink.packets.pop(0)
-        self.assertTrue(ack_packet.ACK)
-        self.server.data_received(ack_packet.__serialize__())
-        
-        self.client.higherProtocol().connection_made.assert_called()
-        self.server.higherProtocol().connection_made.assert_called()
-        
-        client_app_transport, = self.client.higherProtocol().connection_made.call_args[0]
-        server_app_transport, = self.server.higherProtocol().connection_made.call_args[0]
-        
-        client_app_transport.write(b"message 1")
-        client_app_transport.write(b"message 2")
-        client_app_transport.write(b"message 3")
-        
-        # there should be three packets
-        self.assertEqual(len(self.client_transport.sink.packets), 3)
-        data1, data2, data3 = self.client_transport.sink.packets
-        self.client_transport.sink.packets = []
+    def calculate_checksum(self, pkt):
+        new_checksum = b""
+        new_checksum = hashlib.md5(pkt.__serialize__()).digest()
+        return new_checksum
 
-        # packets in reverse order
-        self.server.data_received(data3.__serialize__())
-        self.server.data_received(data2.__serialize__())
+    def close(self):
+        pimpPacket = create_packet(FIN=True)
+        # pimpPacket.data = data
+        pimpPacket.checksum = self.calculate_checksum(pimpPacket)
+        self.lowerTransport().write(pimpPacket.__serialize__())
+        print("** FIN packet sent! Close initiated **")
+
+
+class PIMPServerProtocol(StackingProtocol):
+    def __init__(self):
+        super().__init__()
+        self.deserializer = PIMPPacket.Deserializer()
+        self.transport = None
+        self.stored_number = 0
+        self.established_flag = False
+        self.seqServerDictionary = seqServerDictionary
+        self.stateMachine = "unconnected"
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def connection_lost(self, exc):
+        self.higherProtocol().connection_lost(exc)
+
+    def start_timer(self, pkt):
+        if pkt in self.seqServerDictionary.values():
+            self.transport.write(pkt.__serialize__())
+            print("Resend packet! ", pkt.seqNum)
+        else:
+            print("GOOOOD!")
+
+    def data_received(self, data):
+        self.deserializer.update(data)
+
+        for pimpPacket in self.deserializer.nextPackets():
+            if self.check(pimpPacket):
+                if self.stateMachine == "unconnected":
+                    if pimpPacket.SYN == True and pimpPacket.ACK == False:
+                        # @hint: If receive SYN Packet from client, return SYN-ACK Packet
+                        print("--Received SYN Packet from client.--")
+
+                        synackPacket = create_packet(seqNum=random.randint(1, 2147483647//10), ackNum=pimpPacket.seqNum+1, ACK=True, SYN=True)
+                        synackPacket.checksum = self.calculate_checksum(synackPacket)
+                        #self.transport.write(synackPacket.__serialize__())
+                        self.stored_number = synackPacket.seqNum
+                        new = {synackPacket.seqNum: synackPacket}
+                        self.seqServerDictionary.update(new)
+                        # Start timer
+                        asyncio.get_event_loop().call_later(0.5, self.start_timer, synackPacket)
+                        #print("**SYN-ACK Packet sent back to client!**")
+
+                    elif pimpPacket.ACK == True and pimpPacket.SYN == False:
+                        if self.checkAckNum(pimpPacket):
+                            # @hint: Receive ACK Packet (3rd handshake)
+                            print("3-way handshake established!")
+                            self.stateMachine = "connected"
+                            # @hint: Notify upper layer for connection established?
+                            pimp_transport = PIMPTransport(self.transport)
+                            self.higherProtocol().connection_made(pimp_transport)
+
+                elif self.stateMachine == "connected":
+                    # If three-way handshake has been established, start data tranmission!
+                    if pimpPacket.ACK == True and pimpPacket.data == b"":
+
+                        # @hint: Receive "Data-ACK"
+                        # TODO: Remove that packet from the sent packet cache.
+                        # @hint: Since another endpoint has just acknowledged receiving that piece of data.
+                        print("Received Data ACK.")
+
+                    elif pimpPacket.FIN == True and pimpPacket.ACK == True and pimpPacket.data == b"":
+                        # TODO: If receiving FIN Packet
+                        print("--Received FIN Packet--")
+                        FINACKPacket = create_packet(seqNum=random.randint(1, 2147483647//10), ackNum=pimpPacket.seqNum+1, ACK=True, FIN=True)
+                        FINACKPacket.checksum = self.calculate_checksum(FINACKPacket)
+                        self.transport.write(FINACKPacket.__serialize__())
+                        print("** FINACK packet sent! **")
+                        self.established_flag == False
+                        self.transport.close()
+                        print("CONNECTION CLOSED!")
+
+                    elif pimpPacket.data != b"":
+                        # @hint: (1). return data ACK to client
+                        dataACKPacket = create_packet(ackNum=pimpPacket.seqNum+1, ACK=True)
+                        dataACKPacket.checksum = self.calculate_checksum(dataACKPacket)
+                        self.transport.write(dataACKPacket.__serialize__())
+                        print("Sent ACK back to client")
+
+                        # @hint: (2). pass data to higher layer
+                        self.higherProtocol().data_received(pimpPacket.data)
+                        print("Pass data to application layer")
+
+                    else:
+                        print("There's an error on server side...")
+
+                else:
+                    print("*** Invalid packet is received. That packet is dropped. ***")
+            else:
+                # @hint: resend RTR packet with the same ACK number
+                rtrPacket = create_packet(ackNum=pimpPacket.seqNum+1, RTR=True)
+                rtrPacket.checksum = self.calculate_checksum(rtrPacket)
+                self.transport.write(rtrPacket.__serialize__())
+                print("!!! Checksum test failed. Send RTR Packet back to client! !!!")
+
+    def checkAckNum(self, pkt):
+        if pkt.ackNum-1 in self.seqServerDictionary:
+            print("Received packet with correct ACK number!")
+            print("@@@@@ Server cache: ", self.seqServerDictionary)
+            del self.seqServerDictionary[pkt.ackNum-1]
+            print("@@@@@ Updated server cache: ", self.seqServerDictionary)
+            return True
+        else:
+            return False
+        # for x in self.seqServerDictionary:
+        #     if pkt.ackNum == x+1:
+        #         del self.seqServerDictionary[x]
+        #         return True
+        #     else:
+        #         return False
+
+    def check(self, pkt):
+        old_checksum = pkt.checksum
+        pkt.checksum = b""
+        new_checksum = b""
+        new_checksum = self.calculate_checksum(pkt)
+        if old_checksum == new_checksum:
+            return True
+        else:
+            print("wrong checksum")
+            return False
+
+    def calculate_checksum(self, pkt):
+        new_checksum = b""
+        new_checksum = hashlib.md5(pkt.__serialize__()).digest()
+        return new_checksum
+
+
+class PIMPClientProtocol(StackingProtocol):
+    def __init__(self):
+        super().__init__()
+        self.deserializer = PIMPPacket.Deserializer()
+        self.transport = None
+        self.stored_number = 0
+        self.established_flag = False
+        self.stateMachine = "unconnected"
+        self.seqClientDictionary = seqClientDictionary
+
+    def start_timer(self, pkt):
+        # TODO: If sent packet still in the cache -> it means that NO ACK packet has been responsed!
+        if pkt in self.seqClientDictionary.values():
+            self.transport.write(pkt.__serialize__())
+            print("Resend packet!", pkt.seqNum)
+        else:
+            print("^^ Corresponding ACK has been received! ^^")
+
+    def connection_made(self, transport):
+        # @hint: Send the SYN Packet to initiate the 3-way handshake
+        self.transport = transport
+        synPacket = create_packet(SYN=True)
         
-        self.server.higherProtocol().data_received.assert_not_called()
-        
-        self.server.data_received(data1.__serialize__())
-        serverapp_data_received = self.server.higherProtocol().data_received.call_args_list
-        serverdata = b""
-        while serverapp_data_received:
-            serverdata += serverapp_data_received.pop(0)[0][0]
-        self.assertEqual(serverdata, b"message 1message 2message 3")
-    
-    def test_reordering_with_retransmit(self):
-        self.test_reordering()
-        # assume one re-transmit for each out-of-order message)
-        self.assertEqual(len(self.server_transport.sink.packets),2)
-        self.assertTrue(self.server_transport.sink.packets[0].RTR)
-        self.assertTrue(self.server_transport.sink.packets[1].RTR)
-        
-if __name__ == '__main__':
-    #EnablePresetLogging(PRESET_DEBUG)
-    unittest.main()
+        self.stored_number = synPacket.seqNum
+        new = {synPacket.seqNum: synPacket}
+        self.seqClientDictionary.update(new)
+
+        self.transport.write(synPacket.__serialize__())
+        print("done connection made")
+        print("@@@@@@@@ Client local cache: ", self.seqClientDictionary)
+        print("**SYN Packet sent!**")
+
+        asyncio.get_event_loop().call_later(0.5, self.start_timer, synPacket)#start Timer_ SYN
+
+    def connection_lost(self, exc):
+        self.higherProtocol().connection_lost(exc)
+
+    def data_received(self, data):
+        self.deserializer.update(data)
+        for pimpPacket in self.deserializer.nextPackets():
+            if self.check(pimpPacket):
+                if self.stateMachine == "unconnected":
+                    if pimpPacket.ACK == True and pimpPacket.SYN == True:
+                        if self.checkAckNum(pimpPacket): #check ACK and update dictionary
+                            # @hint: If received packet's ACK number is expected
+                            print("--Received SYN-ACK Packet from server.--")
+
+                            ackPacket = create_packet(ackNum=pimpPacket.seqNum+1, ACK=True)
+                            ackPacket.checksum = self.calculate_checksum(ackPacket)
+                            self.transport.write(ackPacket.__serialize__())
+                            print("**ACK Packet sent!**")
+                            
+                            # @hint: reliable transport layer connection made!
+                            # @hint; notify higher layer that the connection has been established!
+                            self.established_flag = True
+                            self.stateMachine = "connected"
+                            pimp_transport = PIMPTransport(self.transport)
+                            self.higherProtocol().connection_made(pimp_transport)
+
+                        else:
+                            print("ACK number is wrong!")
+
+                    elif pimpPacket.RTR == True:
+                        # @hint: If receive RTR packet, re-send the previous sent packet!
+                        for x in self.seqClientDictionary:
+                            if x == pimpPacket.ackNum - 1:
+                                self.transport.write(
+                                    self.seqClientDictionary.get(x).__serialize__())
+                                print("** RTR Packet resent! **")
+
+                elif self.stateMachine == "connected":
+                    """
+                        * If receiving ACK, it means that the server has received the data packet that was just sent!
+                            => TODO: remove that packet from the cache of sent packets
+                        * If received packets do not have ACK flag, this means that those packets are "Data Packet" sent by the server.
+                            Therefore, return ACKnowledgment back.
+                    """
+                    # @hint" Receive data ACK from server on PIMP layer!
+                    if pimpPacket.ACK == True and pimpPacket.data == b"":
+                        # TODO: remove that sent packet from the local cache
+                        print("--- Received data ACK.---")
+
+                    elif pimpPacket.FIN == True and pimpPacket.ACK == True and pimpPacket.data == b"":
+                        # @hint: Receive FIN-ACK Packet
+                        print("--- Receive FIN-ACK packet from server. ---")
+                        ackPacket = create_packet(ackNum=pimpPacket.seqNum+1, ACK=True)
+                        ackPacket.checksum = self.calculate_checksum(ackPacket)
+                        self.transport.write(ackPacket.__serialize__())
+                        print("** ACK Packet sent to close the connection. **")
+                        self.established_flag == False
+                        self.transport.close()
+                        print("CONNECTION CLOSED!")
+
+                    elif pimpPacket.data != b"0":
+                        # @hint: Contruct Data ACK packet and sent back to server
+                        dataACKPacket = create_packet(seqNum=0, ackNum=pimpPacket.seqNum+1, ACK=True)
+                        dataACKPacket.checksum = self.calculate_checksum(dataACKPacket)
+                        self.transport.write(dataACKPacket.__serialize__())
+                        print("Sent ACK back to client")
+
+                        # @hint: pass data to higher layer
+                        self.higherProtocol().data_received(pimpPacket.data)
+
+                    else:
+                        print("OOP! There's an error on client side")
+
+                else:
+                    print("_____OOPS!!_____")
+
+    def checkAckNum(self, pkt):
+        if pkt.ackNum == self.stored_number + 1:
+            print("Received packet with correct ACK number!")
+            print("@@@@@ Client cache: ", self.seqClientDictionary)
+            del self.seqClientDictionary[self.stored_number]
+            print("@@@@@ Updated client cache: ", self.seqClientDictionary)
+            return True
+        else:
+            return False
+        # for x in self.seqClientDictionary:
+        #     if pkt.ackNum == x+1:
+        #         del self.seqClientDictionary[x]
+        #         return True
+        #     else:
+        #         return False
+
+    def check(self, pkt):
+        old_checksum = pkt.checksum
+        pkt.checksum = b""
+        new_checksum = b""
+        new_checksum = self.calculate_checksum(pkt)
+        if old_checksum == new_checksum:
+            return True
+        else:
+            print("wrong checksum. Packet is corrupted!")
+            return False
+
+    def calculate_checksum(self, pkt):
+        new_checksum = b""
+        new_checksum = hashlib.md5(pkt.__serialize__()).digest()
+        # @hint: Return in "bytes" instead of "string"
+        return new_checksum
+
+
+USAGE = """usage: echotest <mode> [-stack=<stack_name>]
+  mode is either 'server' or a server's address (client mode)"""
+
+if __name__ == "__main__":
+    echoArgs = {}
+
+    stack = "default"
+
+    args = sys.argv[1:]
+    i = 0
+    for arg in args:
+        if arg.startswith("-"):
+            k, v = arg.split("=")
+            echoArgs[k] = v
+        else:
+            echoArgs[i] = arg
+            i += 1
+
+    if "-stack" in echoArgs:
+        stack = echoArgs["-stack"]
+
+    if not 0 in echoArgs:
+        sys.exit(USAGE)
+
+    mode = echoArgs[0]
+    loop = asyncio.get_event_loop()
+    # loop.set_debug(enabled=True)
+    #from playground.common.logging import EnablePresetLogging, PRESET_DEBUG
+    # EnablePresetLogging(PRESET_DEBUG)
+
+    if mode.lower() == "server":
+        coro = playground.create_server(
+            lambda: PIMPServerProtocol(), port=101, family=stack)
+        server = loop.run_until_complete(coro)
+        print("Echo Server Started at {}".format(
+            server.sockets[0].gethostname()))
+        loop.run_forever()
+        loop.close()
+
+    else:
+        remoteAddress = mode
+        coro = playground.create_connection(lambda: PIMPClientProtocol(),
+                                            host=remoteAddress,
+                                            port=101,
+                                            family=stack)
+        transport, protocol = loop.run_until_complete(coro)
+        # print("Echo Client Connected. Starting UI t:{}. p:{}".format(
+        # transport, protocol))
+        loop.run_forever()
+        loop.close()
+
+
+PIMPClientFactory = StackingProtocolFactory.CreateFactoryType(
+    lambda: PIMPClientProtocol())
+PIMPServerFactory = StackingProtocolFactory.CreateFactoryType(
+    lambda: PIMPServerProtocol())
